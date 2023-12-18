@@ -1,5 +1,6 @@
 from nltk.tokenize import word_tokenize
-from handle_text_bert import sent_tokenize
+# from handle_text_bert import sent_tokenize
+from nltk.tokenize import sent_tokenize
 import json
 import os
 from nltk.corpus import stopwords
@@ -128,8 +129,8 @@ def tok_split_lm(context, tokenizer, max_sequence_length = 500):
 				list_toks.append(tok)
 	chunks_toks = [list_toks[x:x+max_sequence_length] for x in range(0, len(list_toks), max_sequence_length)]
 	chunks_idx = [tokenizer.convert_tokens_to_ids(t) for t in chunks_toks]
-	chunks_sent_indx  = [tok2sent[x:x+max_sequence_length] for x in range(0, len(tok2sent), max_sequence_length)]
-	return chunks_toks , chunks_sent_indx, chunks_idx
+	# chunks_sent_indx  = [tok2sent[x:x+max_sequence_length] for x in range(0, len(tok2sent), max_sequence_length)]
+	return tok2sent ,  chunks_idx
 
 def load_bert_tokenizer():
 	tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
@@ -142,7 +143,7 @@ def load_bert_model():
 
 if __name__ == "__main__":
 	context = """ 
-This is done since <cite> the authors </cite> originally consider each image as a different context, while we consider all the images in a single turn as one concatenated context (cf. Figure 3 ).
+Our experiments reveal that the generalization power of a model trained on reputation-based labeled data is not impressive on individually assessed articles. Therefore, we propose to collect and verify larger collections of news articles with reliably assigned labels that would be useful for building more robust fake news detection systems. ---------------------------------- **DATA COLLECTION** Most studies on fake news detection have examined microblogs, headlines and claims in the form of short statements. A few recent studies have examined full articles (i.e., actual 'fake news') to extract discriminative linguistic features of misinformation<cite> Rashkin et al., 2017</cite>; Horne and Adali, 2017) . The issue with these studies is the data collection methodology. Texts are harvested from websites that are assumed to be fake news publishers (according to a list of suspicious websites), with no individual labeling of data. The so-called suspicious sources, however, sometimes do publish facts and valid information, and reputable websites sometimes publish inaccurate information (Mantzarlis, 2017) . The key to collect more reliable data, then, is to not rely on the source but on the text of the article itself, and only after the text has been assessed by human annotators and determined to contain false information.
 """
 	# sents = sent_split(context)
 	# print(len(sents))
@@ -152,8 +153,9 @@ This is done since <cite> the authors </cite> originally consider each image as 
 
 	# print(len(context.split()))
 	tokenizer = load_bert_tokenizer()
-	chunks_toks , chunks_sent_indx, chunks_idx = tok_split_lm(context , tokenizer)
+	tok2sent ,  chunks_idx = tok_split_lm(context , tokenizer, max_sequence_length=20)
 	lm = load_bert_model()
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	model = Model(pretrained_model= lm , word_emb_dim=768 , sent_emb_dim= 768 , device=device)
-	model(chunks_idx)
+	model = model.to(device)
+	model(chunks_idx , tok2sent)

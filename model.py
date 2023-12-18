@@ -11,7 +11,6 @@ class Model(nn.Module):
 		self.word_emb_dim = word_emb_dim # for roberta large, it is set by 1024
 		self.sent_emb_dim = sent_emb_dim # this value usually is set by 64 
 		self.linear_pool = nn.Linear(self.word_emb_dim , self.sent_emb_dim , bias=True)
-	
 		#self.sent_encoder = SentenceEncoder(self.n_block, self.sent_emb_dim, self.device)
 #		self.classifier_layer = Classifier(self.sent_emb_dim, self.word_emb_dim, self.device)
 
@@ -20,71 +19,66 @@ class Model(nn.Module):
 		ques_embed , list_sent_emb , batch_bound_sents = self.pool_embed(last_hidden_state , batch_feature) #init embed contain question embedding and list of sentence embedding 
 		return ques_embed , list_sent_emb , batch_bound_sents
 
-	def forward(self, chunks_idx):
+	def forward(self, chunks_idx , tok2sent_ind, func_embed):
 		#chunk idx: list of tokens'index in the citation context
 		#--> need to add the cls token and sep token into start/end position of original sequence 
+		#func embed shape (N_function , func hidden size)
 		input = [ [101] + t + [102]  for t in chunks_idx] 
-		input = torch.tensor(input)
-		last_hidden_state = self.pretrained_model(input) #shape (bs , seq_len , hidden size ) 
+		last_hidden_state = self.forward_pretrained(input) #shape (bs , seq_len , hidden size ) 
+		toks_embed = self.extract_tok_emb(last_hidden_state) #shape (n_tok , word dim)
+		sents_embed = self.sent_pool(toks_embed , tok2sent_ind) #shape (N_sent , sent dim ) 
+		sents_hid , func_hid = self.sent_func_interaction(sents_embed , func_embed) #(N_sent , word dim) (N_func, word dim)
+		doc_emb = self.doc_pool(func_hid) #(word dim)
+		doc_logit = self.compute_doc_logit(doc_emb) # (N_func) ---> use for multi binary loss 
+		return doc_logit   
 
-		return start_logit , end_logit  
+	def extract_tok_emb(self, list_hidden_state):
+		result = [] 
+		for t in list_hidden_state:
+			result.append(t[1:-1,:])
+		result = torch.cat(result , dim = 0)
+		return result 
 
-	def get_spare_embed(self , sent_hidden_state , last_hidden_state , batch_bound_sents):
-		#this function is used to remove padding vector from tensor. 
-		#sent hidden state: (bs , max sent , sent dim ) now will be converted into form of list of tensor (N_sent , sent dim). In this, N_sent can be different between elements 
-		#last hidden state: (bs , seq length , word dim) must be converted to form: list of list of element. len of first list is batch size 
-		# Second list is list of sentences in each passages. Each list can have different length 
-		# Each element in list is tensor. This tensor has shape (N_words , word dim ). N_words is number of word appeared in particular sentence
-		# To create the aforementioned object, we use batch bound sent  to extract number of words in sentence as well as number of sentences in passage 
-		#batch bound sent is list , each element in list is 2-element list. It express start token and end token in certain sentence
-		sent_result , word_result = [] , [] 
-		for i in range(len(batch_bound_sents)):
-			sent_result.append(sent_hidden_state[i][:len(batch_bound_sents[i])]) #only acquire real sentence 
-			list_word_embed = [] 
-			for j in range(len(batch_bound_sents[i])):
-				start , end = batch_bound_sents[i][j][0] , batch_bound_sents[i][j][1]
-				list_word_embed.append(last_hidden_state[i , start : end + 1 , : ]) #shape (end - start , word dim )
-			#len list word embed = number of sentence in each passage 
-			word_result.append(list_word_embed) # len word result = number of passage in batch = batch size 
-		return sent_result , word_result
-
-	def recover_original_sequence(self , last_hidden_state , paragraph_embed_start, paragraph_embed_end , batch_bound_sents):
-		start_logit , end_logit = [] , [] 
-		for i in range(len(paragraph_embed_start)):
-			start_passage , end_passage = batch_bound_sents[i][0][0] , batch_bound_sents[i][-1][1]
-			start_logit.append(torch.cat( (last_hidden_state[i , : start_passage , : ] , paragraph_embed_start[i], last_hidden_state[i , end_passage + 1 : , :] ) ))
-			end_logit.append(torch.cat( (last_hidden_state[i , : start_passage , : ] , paragraph_embed_end[i], last_hidden_state[i , end_passage + 1  :, :] ) ))
-		return torch.stack(start_logit , dim  = 0) , torch.stack(end_logit , dim = 0) #shape (bs , seq length , word dim )
-
-	def forward_pretrained(self, features , max_batch = 8 ):
-		all_input_ids = torch.tensor([s.input_ids for s in features], dtype=torch.long).to(self.device)
+	def forward_pretrained(self, input ):
+		#input shape list of list of indexes of tokens in citation context [ [] , [] ] 
+		# all_input_ids = torch.tensor([s.input_ids for s in features], dtype=torch.long).to(self.device)
 		output = []
-		for i in range(all_input_ids.shape[0]):
-			input_id= all_input_ids[i, : ].unsqueeze(0)
-			t = self.pretrained_model(input_id)[0] #shape (1 , N_word , word dim)
+		for i in range(len(input)):
+			# input_id= all_input_ids[i, : ].unsqueeze(0)
+			x  = torch.tensor(input[i] , dtype=torch.long).to(self.device).unsqueeze(0) #shape (1 , N_word)
+			t = self.pretrained_model(x)[0] #shape (1 , N_word , word dim)
 			output.append(t.squeeze(0)) #shape (N_word , word dim )
-		output = torch.stack(output ) #shape (N_chunk , N_word , word dim)
+		# output = torch.stack(output ) #shape (N_chunk , N_word , word dim)
 		return output 
 
-	def pool_embed(self, roberta_embed, features , method_pool = 'mean'):
-	#roberta embed of each sample in a batch: shape (sequen_length , hidden size)
-		results = [] #results is list, one element in result correspond with triple value (question embed , sents_embed, unique_subword_embed) of single feature
-		#features can be understood as batch of features
-		batch_bound_sents = []
-		ques_embed , sents_embed = [] , []
-		for i, feature in enumerate(features):
-			bound_question, bound_sents  = find_boudaries_single_feature(feature)
-			batch_bound_sents.append(bound_sents)
+	def sent_pool(self, tok_embed, tok2sent_ind ,  method_pool = 'mean'):
+		#tok_embed: shape (sequen_length , hidden size)
+		bound_sents = find_boudary_sents(tok2sent_ind)
 			
-			question_embed = pool_sequential_embed(roberta_embed[i] , bound_question[0] , bound_question[1] , method_pool) #shape (hidden_size)
-			question_embed = torch.tanh(self.linear_pool(question_embed)) #shape (bs , sent dim )
-			#sent emb has different dim with word emb
-			batch_sent_embed = [] 
-			for bound_sent in bound_sents:
-				batch_sent_embed.append(torch.tanh(self.linear_pool(pool_sequential_embed(roberta_embed[i] , bound_sent[0] , bound_sent[1] , method_pool) )))
-			batch_sent_embed = torch.stack(batch_sent_embed , axis = 0) #shape (num_sent , hidden_size)	
-			
-			sents_embed.append(batch_sent_embed)
-			ques_embed.append(question_embed)
-		ques_embed = torch.stack(ques_embed) #shape (bs , sent dim )
-		return ques_embed , sents_embed , batch_bound_sents
+		sents_emb = [] 
+		for bound_sent in bound_sents:
+			sents_emb.append(torch.tanh(self.linear_pool(pool_sequential_embed(tok_embed , bound_sent[0] , bound_sent[1] , method_pool) )))
+		sents_emb = torch.stack(sents_emb , dim = 0) #shape (N_sent , sent dim )
+
+		return sents_emb
+
+def pool_sequential_embed(roberta_embed , start , end , method):
+	if method =='mean':
+		sub_matrix = roberta_embed[start:end+1 , :] 
+		return torch.mean(sub_matrix , axis = 0 ) 
+
+def find_boudary_sents(tok2sent_idx):
+	#bound sents
+	sent_tok = {}
+
+	for i in range(len(tok2sent_idx)):
+		if tok2sent_idx[i] not in sent_tok:
+			sent_tok[tok2sent_idx[i]] = [i]
+		else:
+			sent_tok[tok2sent_idx[i]].append(i)
+
+	bound_sents = [] 
+	for sent_id in sent_tok:
+		bound_sents.append([sent_tok[sent_id][0],sent_tok[sent_id][-1]])
+
+	return bound_sents
